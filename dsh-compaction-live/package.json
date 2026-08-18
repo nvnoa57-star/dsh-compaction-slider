@@ -1,0 +1,19 @@
+{
+  "name": "@my-scope/dsh-compaction-live",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-compaction-basic": "0.1.0-rc.6"
+  },
+  "files": [
+    "lib/index.js"
+  ]
+}

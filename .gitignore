@@ -1,0 +1,9 @@
+# Local DSH profile junction tree — never commit
+node_modules/
+
+# npm
+*.tgz
+
+# misc
+.DS_Store
+Thumbs.db
