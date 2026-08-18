@@ -21,26 +21,26 @@ window.__ModuleLoader__.load({
 		//#region lib/types/client/index.js
 		/** Dictionary namespace owned by this plugin. */
 		const NS = "compactThreshold";
-		/** Required services for the input-right slider and the settings scope. */
-		const inject = ["slots", "locale", "settingsScope"];
+		/** Required services: the conversation slot system, locale, and the typert Remote transport. */
+		const inject = ["slots", "locale", "remote", "remote.commands"];
 
 		const zh = {
 			"label": "压缩",
 			"used": "已用",
 			"threshold": "触发比例",
-			"panel.title": "上下文压缩阈值",
-			"panel.desc": "会话占用达到上下文窗口该比例时,自动压缩旧历史。",
-			"unavailable": "设置未开放",
-			"saving": "保存中…"
+			"panel.title": "上下文压缩阈值(本会话)",
+			"panel.desc": "仅对本会话生效:会话占用达到上下文窗口该比例时,自动压缩旧历史。默认 80%。",
+			"saving": "保存中…",
+			"saveFailed": "保存失败"
 		};
 		const en = {
 			"label": "Compact",
 			"used": "used",
 			"threshold": "Trigger ratio",
-			"panel.title": "Context compaction threshold",
-			"panel.desc": "Auto-compact old history when the session reaches this ratio of the context window.",
-			"unavailable": "Settings not exposed",
-			"saving": "Saving…"
+			"panel.title": "Context compaction threshold (this session)",
+			"panel.desc": "Applies to this session only: auto-compact old history when the session reaches this ratio of the context window. Default 80%.",
+			"saving": "Saving…",
+			"saveFailed": "Save failed"
 		};
 
 		/** 1.2e5 -> "120K"; 1.2e6 -> "1.2M". */
@@ -53,41 +53,50 @@ window.__ModuleLoader__.load({
 
 		/**
 		* ThresholdControl: a compact chip beside the ContextMeter ring. Click
-		* opens a popover with a 0.4-1.0 range slider that writes the `compaction`
-		* settings namespace live (debounced); the current context occupancy rides
-		* the `contextPressure` projection alongside it.
+		* opens a popover with a 0.4-1.0 range slider that writes THIS session's
+		* threshold through the `/threshold` command (debounced); the value comes
+		* from the session-scoped `compactionThreshold` projection (default 0.8),
+		* and the current context occupancy rides `contextPressure` alongside it.
 		*/
-		function ThresholdControl({ scope, t, useProjection }) {
+		function ThresholdControl({ onSet, t, useProjection }) {
 			const [open, setOpen] = react.useState(false);
 			const [draft, setDraft] = react.useState(null);
 			const [saving, setSaving] = react.useState(false);
+			const [saveError, setSaveError] = react.useState(null);
 			const timer = react.useRef(null);
 			const wrapRef = react.useRef(null);
+			const lastCommittedRef = react.useRef(null);
+			const latestDraftRef = react.useRef(null);
 
-			const snapshot = react.useSyncExternalStore(
-				(listener) => scope.subscribe(listener),
-				() => scope.getSnapshot()
-			);
-			const stored = snapshot && snapshot.value && typeof snapshot.value.thresholdRatio === "number"
-				? snapshot.value.thresholdRatio
+			const projection = useProjection("compactionThreshold");
+			const stored = projection && typeof projection.thresholdRatio === "number"
+				? projection.thresholdRatio
 				: 0.8;
-			const unavailable = snapshot ? snapshot.status === "unavailable" : false;
 
 			const pressure = useProjection("contextPressure");
 			const ratio = draft ?? stored;
 			const percent = Math.max(0, Math.min(100, Math.round(ratio * 100)));
 
 			const commit = (value) => {
+				if (lastCommittedRef.current === value) return;
+				lastCommittedRef.current = value;
 				if (timer.current) {
 					clearTimeout(timer.current);
 					timer.current = null;
 				}
 				setSaving(true);
-				scope.set("thresholdRatio", value).finally(() => setSaving(false));
+				onSet(value).then(() => {
+					setSaveError(null);
+				}).catch((error) => {
+					console.error("compaction-threshold: write failed", error);
+					lastCommittedRef.current = null;
+					setSaveError(error instanceof Error ? error.message : String(error));
+				}).finally(() => setSaving(false));
 			};
 			const onChange = (event) => {
 				const value = Number(event.target.value);
 				setDraft(value);
+				latestDraftRef.current = value;
 				if (timer.current) clearTimeout(timer.current);
 				timer.current = setTimeout(() => commit(value), 250);
 			};
@@ -105,7 +114,16 @@ window.__ModuleLoader__.load({
 			}, [open]);
 
 			react.useEffect(() => () => {
-				if (timer.current) clearTimeout(timer.current);
+				if (timer.current) {
+					clearTimeout(timer.current);
+					timer.current = null;
+					const pending = latestDraftRef.current;
+					if (pending !== null && lastCommittedRef.current !== pending) {
+						onSet(pending).catch((error) => {
+							console.error("compaction-threshold: flush on unmount failed", error);
+						});
+					}
+				}
 			}, []);
 
 			const onKeyDown = (event) => {
@@ -150,12 +168,14 @@ window.__ModuleLoader__.load({
 						max: 1,
 						step: 0.05,
 						value: ratio,
-						disabled: unavailable,
 						onChange,
 						onPointerUp: onRelease,
 						onKeyUp: onRelease
 					}),
-					react.createElement("div", { className: "cc-saving" }, saving ? t("saving") : ""),
+					react.createElement("div", {
+						className: "cc-saving" + (saveError ? " cc-saving-error" : ""),
+						style: saveError ? { color: "var(--dsw-alias-state-error-primary)" } : undefined
+					}, saveError ? (t("saveFailed") + ": " + saveError) : (saving ? t("saving") : "")),
 					react.createElement(
 						"div",
 						{ className: "cc-used" },
@@ -167,17 +187,26 @@ window.__ModuleLoader__.load({
 
 		/**
 		* Client plugin body: the threshold chip in the composer tool row, right
-		* before the send button (beside the ContextMeter ring).
+		* before the send button (beside the ContextMeter ring). Writes go through
+		* the already-mounted `commands.execute` Remote (`/threshold <ratio>`),
+		* which appends a session-scoped `command/run` log event the host folds
+		* back into the `compactionThreshold` projection.
 		*/
 		function apply(ctx) {
 			ctx.effect(() => ctx.locale.register(NS, { zh, en }), "compaction-ui: dictionaries");
-			const scope = ctx.settingsScope.bind({ namespace: "compaction" });
 			ctx.slots.inject("conversation.input.right", () => ctx.slots.register({
 				name: "conversation.input.right",
 				id: "compact-threshold",
 				order: 10,
 				locale: NS,
-				inject: () => ({ scope })
+				inject: (sessionId) => ({
+					onSet: async (ratio) => {
+						const result = await ctx.remote.commands.execute(sessionId, "/threshold " + ratio.toFixed(2));
+						if (!result.ok) {
+							throw new Error(`commands/execute: ${result.error?.code ?? "unknown"} ${result.error?.message ?? ""}`);
+						}
+					}
+				})
 			}, ThresholdControl));
 		}
 		//#endregion

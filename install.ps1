@@ -7,17 +7,13 @@ DSH 上下文压缩阈值滑块插件 - 一键安装/卸载脚本
 自动完成以下全部安装步骤(幂等,可重复执行):
   1. 复制插件包到 $DSH_HOME/profiles/node_modules/@my-scope/
   2. 在 web profile 的 cordis.patch.yml 注册 compaction-settings 插件行
-  3. 在 dsh-host-apiproxy 的 WEB_SETTINGS_NAMESPACES 放行 "compaction"
-  4. 安装 auto-compact 用户预设(压缩后端为实时读阈值版本)
-  5. 设置 agent-presets.default = auto-compact(新会话生效)
+  3. 安装 auto-compact 用户预设(压缩后端为按会话实时读阈值版本)
+  4. 设置 agent-presets.default = auto-compact(新会话生效)
 每次修改前都会在 $DSH_HOME/install-backups/<时间戳>/ 备份原文件。
+本方案不修改任何 node_modules 内部文件,升级 dsh 后无需重装。
 
 .PARAMETER DshHome
 DSH 数据目录,默认取 $env:DSH_HOME,否则 ~/.dsh。
-
-.PARAMETER ApiProxyFile
-dsh-host-apiproxy 的 index.js 路径。默认自动探测
-($DSH_HOME/profiles/node_modules/@deepseek-ai/dsh-host-apiproxy 或 npm 全局目录)。
 
 .PARAMETER Force
 预设已存在时覆盖安装(auto-compact)。
@@ -25,11 +21,8 @@ dsh-host-apiproxy 的 index.js 路径。默认自动探测
 .PARAMETER NoDefault
 不修改 agent-presets.default(需要自己在 UI 里选择 auto-compact 预设)。
 
-.PARAMETER SkipApiProxy
-跳过 apiproxy 放行名单修改(仅当你的 dsh 版本已原生放行 compaction 时使用)。
-
 .PARAMETER Uninstall
-反向卸载:移除 apiproxy 放行、移除 patch 行、删除 @my-scope 插件目录。
+反向卸载:移除 patch 行、删除 @my-scope 插件目录。
 (preset 与 default 设置属于用户数据,默认保留;加 -Force 一并删除。)
 
 .EXAMPLE
@@ -40,10 +33,8 @@ dsh-host-apiproxy 的 index.js 路径。默认自动探测
 [CmdletBinding()]
 param(
     [string]$DshHome,
-    [string]$ApiProxyFile,
     [switch]$Force,
     [switch]$NoDefault,
-    [switch]$SkipApiProxy,
     [switch]$Uninstall
 )
 
@@ -54,40 +45,11 @@ $Repo = $PSScriptRoot
 function Write-Step([string]$msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 function Write-Ok([string]$msg)   { Write-Host "    OK   $msg" -ForegroundColor Green }
 function Write-Info([string]$msg) { Write-Host "    ...  $msg" -ForegroundColor Gray }
-function Write-WarnMsg([string]$msg) { Write-Host "    !!   $msg" -ForegroundColor Yellow }
 
 function Get-DshHome {
     if ($DshHome) { return $DshHome }
     if ($env:DSH_HOME) { return $env:DSH_HOME }
     return Join-Path $HOME ".dsh"
-}
-
-function Get-NpmGlobalRoot {
-    $npm = if ($env:OS -eq "Windows_NT") { "npm.cmd" } else { "npm" }
-    try {
-        $root = (& $npm root -g 2>$null | Select-Object -Last 1)
-        if ($root -and (Test-Path -LiteralPath $root)) { return $root.Trim() }
-    } catch { }
-    if ($env:APPDATA) { $alt = Join-Path $env:APPDATA "npm\node_modules"; if (Test-Path -LiteralPath $alt) { return $alt } }
-    return $null
-}
-
-function Resolve-ApiProxy {
-    if ($ApiProxyFile) { return $ApiProxyFile }
-    $dshRoot = Get-DshHome
-    $candidates = @(
-        (Join-Path $dshRoot "profiles\node_modules\@deepseek-ai\dsh-host-apiproxy\lib\index.js"),
-        (Join-Path $dshRoot "profiles\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-host-apiproxy\lib\index.js")
-    )
-    $npmRoot = Get-NpmGlobalRoot
-    if ($npmRoot) {
-        $candidates += (Join-Path $npmRoot "@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-host-apiproxy\lib\index.js")
-        $candidates += (Join-Path $npmRoot "@deepseek-ai\dsh-host-apiproxy\lib\index.js")
-    }
-    foreach ($c in $candidates) {
-        if (Test-Path -LiteralPath $c) { return $c }
-    }
-    return $null
 }
 
 function Read-Utf8([string]$path) { return [System.IO.File]::ReadAllText($path) }
@@ -164,40 +126,7 @@ function Revert-CordisPatch {
     Write-Ok "cordis.patch.yml 已移除插件行 (备份: $backup)"
 }
 
-# ---------- 3. patch apiproxy allowlist ----------
-function Update-ApiProxy {
-    $path = Resolve-ApiProxy
-    if (-not $path) {
-        Write-WarnMsg "找不到 dsh-host-apiproxy/index.js,请手动在 WEB_SETTINGS_NAMESPACES 数组中添加 `"compaction`""
-        return
-    }
-    $content = Read-Utf8 $path
-    if ($content -match '(?s)WEB_SETTINGS_NAMESPACES\s*=\s*\[[^\]]*"compaction"') {
-        Write-Ok "apiproxy 已放行 compaction,跳过 ($path)"
-        return
-    }
-    if ($content -notmatch 'WEB_SETTINGS_NAMESPACES\s*=\s*\[') {
-        Write-WarnMsg "在 $path 中未找到 WEB_SETTINGS_NAMESPACES,dsh 版本可能不兼容,请手动放行 compaction"
-        return
-    }
-    $backup = Backup-File $path
-    $content = [regex]::Replace($content, "(WEB_SETTINGS_NAMESPACES\s*=\s*\[)", ('${1}' + "`n`t`"compaction`","), 1)
-    Write-Utf8NoBom $path $content
-    Write-Ok "apiproxy 已放行 compaction (备份: $backup)"
-}
-
-function Revert-ApiProxy {
-    $path = Resolve-ApiProxy
-    if (-not $path) { return }
-    $content = Read-Utf8 $path
-    if ($content -notmatch '(?m)^[ \t]*"compaction",[ \t]*$') { Write-Ok "apiproxy 无 compaction 放行,跳过"; return }
-    $backup = Backup-File $path
-    $content = [regex]::Replace($content, "(?m)^[ \t]*`"compaction`",[ \t]*\r?\n", "", 1)
-    Write-Utf8NoBom $path $content
-    Write-Ok "apiproxy 已移除 compaction 放行 (备份: $backup)"
-}
-
-# ---------- 4. install auto-compact preset ----------
+# ---------- 3. install auto-compact preset ----------
 function Install-Preset {
     $dshRoot = Get-DshHome
     $src = Join-Path $Repo "presets\auto-compact"
@@ -223,7 +152,7 @@ function Remove-Preset {
     }
 }
 
-# ---------- 5. set default preset ----------
+# ---------- 4. set default preset ----------
 function Set-DefaultPreset {
     $dshRoot = Get-DshHome
     $path = Join-Path $dshRoot "settings.yaml"
@@ -257,7 +186,6 @@ Write-Host ("DSH home: " + (Get-DshHome))
 
 if ($Uninstall) {
     Write-Step "卸载插件"
-    if (-not $SkipApiProxy) { Revert-ApiProxy }
     Revert-CordisPatch
     Remove-Packages
     if ($Force) { Remove-Preset }
@@ -266,19 +194,16 @@ if ($Uninstall) {
     exit 0
 }
 
-Write-Step "1/5 安装插件包"
+Write-Step "1/4 安装插件包"
 Install-Packages
 
-Write-Step "2/5 注册 web profile 插件行"
+Write-Step "2/4 注册 web profile 插件行"
 Update-CordisPatch
 
-Write-Step "3/5 放行 compaction settings 命名空间"
-if ($SkipApiProxy) { Write-Info "已跳过 (-SkipApiProxy)" } else { Update-ApiProxy }
-
-Write-Step "4/5 安装 auto-compact 预设"
+Write-Step "3/4 安装 auto-compact 预设"
 Install-Preset
 
-Write-Step "5/5 设置默认预设"
+Write-Step "4/4 设置默认预设"
 if ($NoDefault) { Write-Info "已跳过 (-NoDefault)" } else { Set-DefaultPreset }
 
 Write-Host ""
@@ -287,8 +212,7 @@ Write-Host ""
 Write-Host " 下一步:" -ForegroundColor White
 Write-Host "  1. 重启 dsh web (先停止占用 3080 端口的进程,再重新运行 dsh web)"
 Write-Host "  2. 打开浏览器,输入栏 ContextMeter 圆环旁会出现「压缩 XX%」滑块 (0.4~1.0)"
-Write-Host "  3. 注意: 旧会话仍使用之前的预设,需新建会话才生效;滑块调整对运行中会话"
-Write-Host "     在下一个 step 边界即时生效"
-Write-Host ""
-Write-Host "  已知限制: dsh 升级 (npm update) 会覆盖 apiproxy 放行,重跑本脚本即可修复。" -ForegroundColor Yellow
+Write-Host "  3. 滑块按会话独立:每个会话可单独调整,默认 80%;也直接在聊天里输入"
+Write-Host "     /threshold 0.65 设置;切换会话/重启 dsh 均保留"
+Write-Host "  4. 旧会话仍使用之前的预设,需新建会话才生效"
 Write-Host "====================================================" -ForegroundColor Green
